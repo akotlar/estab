@@ -7,12 +7,10 @@ import (
 	"flag"
 	"fmt"
 
-	// "github.com/bitly/go-simplejson"
-	"github.com/davecgh/go-spew/spew"
+	// "github.com/davecgh/go-spew/spew"
 	"github.com/miku/estab"
 	"golang.org/x/net/context"
 	"golang.org/x/sync/errgroup"
-	"gopkg.in/cheggaaa/pb.v1"
 	"gopkg.in/olivere/elastic.v3"
 
 	"io"
@@ -31,10 +29,12 @@ func main() {
 	typesString := flag.String("types", "", "comma-separated types to search (or all)")
 	fieldsString := flag.String("f", "", "field or fields space separated")
 	// timeout := flag.String("timeout", "10m", "scroll timeout")
-	size := flag.Int("size", 10000, "scroll batch size")
+	size := flag.Int("size", 1000, "scroll batch size")
 	nullValue := flag.String("null", "NA", "value for empty fields")
-	separator := flag.String("separator", "|", "separator to use for multiple field values")
+	separator := flag.String("separator", ";", "separator to use for multiple field values")
+	secondarySeparator := flag.String("secondarySeparator", "|", "separator to represent  the inner array of an array of values as a string")
 	delimiter := flag.String("delimiter", "\t", "column delimiter")
+
 	// limit := flag.Int("limit", -1, "maximum number of docs to return (return all by default)")
 	version := flag.Bool("v", false, "prints current program version")
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
@@ -80,8 +80,6 @@ func main() {
 	// indices := strings.Fields(*indicesString)
 	fields := strings.Fields(*fieldsString)
 
-	spew.Dump(fields)
-
 	if *raw && *singleValue {
 		log.Fatal("-1 xor -raw ")
 	}
@@ -101,46 +99,34 @@ func main() {
 		query["fields"] = fields
 	}
 
-	jsonByteArray, err := json.Marshal(query)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	spew.Dump(query)
-
-	println("\n\n")
-
-	queryStringWithFields := string(jsonByteArray) //string(jsonByteArray)
-
 	client, err := elastic.NewClient(elastic.SetURL(fmt.Sprintf("%s:%s", *host, *port)))
 
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	f := elastic.NewRawStringQuery(queryStringWithFields)
+	// TODO: reactivate, with progress reports via redis
+	// f := elastic.NewRawStringQuery(queryStringWithFields)
 
-	spew.Dump(f)
+	// spew.Dump(f)
 
 	// Count total and setup progress
-	total, err := client.Count().Index(*indicesString).Type(*typesString).Query(elastic.NewRawStringQuery(*queryString)).Do()
+	// total, err := client.Count().Index(*indicesString).Type(*typesString).Query(elastic.NewRawStringQuery(*queryString)).Do()
 
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	bar := pb.StartNew(int(total))
+	// bar := pb.StartNew(int(total))
 	// 1st goroutine sends individual hits to channel.
-	hits := make(chan map[string]interface{})
-	// resultsChannel := make(chan [string])
+	hits := make(chan json.RawMessage)
 
 	g, ctx := errgroup.WithContext(context.Background())
 
 	g.Go(func() error {
 		defer close(hits)
 		// Initialize scroller. Just don't call Do yet.
-		cursor, err := client.Scan(*indicesString).Fields(fields...).Query(elastic.NewRawStringQuery(*queryString)).Type(*typesString).Size(*size).Do()
+		cursor, err := client.Scan().Source(*queryString).Index(*indicesString).Type(*typesString).Size(*size).Do()
 
 		if err != nil {
 			log.Fatal(err)
@@ -157,7 +143,7 @@ func main() {
 
 			// Send the hits to the hits channel
 			for _, hit := range results.Hits.Hits {
-				hits <- hit.Fields
+				hits <- *hit.Source
 			}
 
 			// Check if we need to terminate early
@@ -184,52 +170,75 @@ func main() {
 	//
 	// If you want, setup a number of goroutines handling deserialization in parallel.
 	g.Go(func() error {
-		for hit := range hits {
+		for jsonHit := range hits {
 
-			// Each hit is a row
+			var hit map[string]interface{}
+			err := json.Unmarshal(jsonHit, &hit)
+
+			if err != nil {
+				log.Fatal(err)
+				return err
+			}
+
 			var columns []string
-			// Deserialize
-			// var item map[string]interface{}
-			// err := json.Unmarshal(hit, &item)
 
-			// if err != nil {
-			// 	return err
-			// }
-
-			foundData := false
 			for _, f := range fields {
 				var c []string
-				// Do something with the product here, e.g. send it to another channel
-				// for further processing.
-				switch value := hit[f].(type) {
+				foundInnerArray := false
+
+				var fieldArray []string
+				var fieldValue interface{}
+
+				// The value we're looking for may be deeply nested
+				var buriedObject map[string]interface{}
+				buriedObject = hit
+
+				if strings.Contains(f, ".") {
+					fieldArray = strings.Split(f, ".")
+				} else {
+					fieldArray = []string{f}
+				}
+
+				// Iterate over the nested json structure
+				// We expect that any Seqant field is only a scalar or array
+				// Because we expect that this package is provided the fully qualified
+				// Path to the value (e.g if { refSeq => {geneSymbol: DLG1}}
+				// we are given "refSeq.geneSymbol")
+				for _, fieldNamePart := range fieldArray {
+					if val, ok := buriedObject[fieldNamePart]; ok {
+						switch item := val.(type) {
+						case map[string]interface{}:
+							buriedObject = item
+						default:
+							fieldValue = item
+						}
+					}
+				}
+
+				//TODO: write into recursive function
+				switch value := fieldValue.(type) {
+				case nil:
+					c = []string{*nullValue}
 				case string:
-					foundData = true
 					if value == "" && *zeroAsNull {
 						c = append(c, *nullValue)
 					} else {
 						c = append(c, value)
 					}
 				case float64:
-					foundData = true
 					if !isFloatingPoint(value) {
 						c = append(c, fmt.Sprintf("%.0f", value))
 					} else {
 						c = append(c, strconv.FormatFloat(value, 'G', *precision, 64))
 					}
 				case bool:
-					foundData = true
 					c = append(c, strconv.FormatBool(value))
-				case nil:
-					c = []string{*nullValue}
 				case []interface{}:
-					// fmt.Printf("%s is interface\n", f)
 					for _, e := range value {
 						switch e.(type) {
 						case nil:
 							c = []string{*nullValue}
 						case string:
-							foundData = true
-							// fmt.Printf("%s is string %s\n", f, e.(string))
 							s := e.(string)
 							if s == "" && *zeroAsNull {
 								c = append(c, *nullValue)
@@ -237,76 +246,71 @@ func main() {
 								c = append(c, e.(string))
 							}
 						case float64:
-							foundData = true
-							// fmt.Printf("%s is a float %f\n", f, e.(float64))
 							if !isFloatingPoint(e.(float64)) {
 								c = append(c, fmt.Sprintf("%.0f", e.(float64)))
 							} else {
 								c = append(c, strconv.FormatFloat(e.(float64), 'G', *precision, 64))
 							}
 						case bool:
-							foundData = true
-							// fmt.Printf("%s is bool %b", f, e.(bool))
 							c = append(c, strconv.FormatBool(e.(bool)))
+
+						// This is an inner array
+						case []interface{}:
+							foundInnerArray = true
+							var innerArray []string
+							// fmt.Printf("%s is inner interface\n", f)
+
+							for _, innerVal := range e.([]interface{}) {
+								switch innerVal.(type) {
+								case nil:
+									innerArray = []string{*nullValue}
+								case string:
+									// fmt.Printf("%s is string %s\n", f, innerVal.(string))
+									s := innerVal.(string)
+									if s == "" && *zeroAsNull {
+										innerArray = append(innerArray, *nullValue)
+									} else {
+										innerArray = append(innerArray, innerVal.(string))
+									}
+								case float64:
+									// fmt.Printf("%s is a float %f\n", f, innerVal.(float64))
+									if !isFloatingPoint(innerVal.(float64)) {
+										innerArray = append(innerArray, fmt.Sprintf("%.0f", innerVal.(float64)))
+									} else {
+										innerArray = append(innerArray, strconv.FormatFloat(innerVal.(float64), 'G', *precision, 64))
+									}
+								case bool:
+									innerArray = append(innerArray, strconv.FormatBool(innerVal.(bool)))
+								default:
+									log.Fatal(fmt.Errorf("Invalid type found %+v\n", innerVal))
+								}
+							}
+
+							if len(innerArray) > 0 {
+								c = append(c, strings.Join(innerArray, *separator))
+							}
 						default:
-							fmt.Printf("For %s none of the types match", f)
+							log.Fatal(fmt.Errorf("Invalid type found %+v\n", e))
 						}
-						// case []interface{}:
-						// 	fmt.Printf("%s is inner interface\n", f)
-						// 	for _, e := range value {
-						// 		switch e.(type) {
-						// 		case nil:
-						// 			c = []string{*nullValue}
-						// 		case string:
-						// 			foundData = true
-						// 			fmt.Printf("%s is string %s\n", f, e.(string))
-						// 			s := e.(string)
-						// 			if s == "" && *zeroAsNull {
-						// 				c = append(c, *nullValue)
-						// 			} else {
-						// 				c = append(c, e.(string))
-						// 			}
-						// 		case float64:
-						// 			foundData = true
-						// 			fmt.Printf("%s is a float %f\n", f, e.(float64))
-						// 			if !isFloatingPoint(e.(float64)) {
-						// 				c = append(c, fmt.Sprintf("%.0f", e.(float64)))
-						// 			} else {
-						// 				c = append(c, strconv.FormatFloat(e.(float64), 'G', *precision, 64))
-						// 			}
-						// 		case bool:
-						// 			foundData = true
-						// 			fmt.Printf("%s is bool %b\n", f, e.(bool))
-						// 			c = append(c, strconv.FormatBool(e.(bool)))
-						// 		}
-						// 	}
-						// default:
-						// 	// spew.Dump(value)
-						// 	// fmt.Printf("unknown field type in response: %+v\n", item.Fields[f])
-						// 	// log.Fatalf("unknown field type in response: %+v\n", item.Fields[f])
-						// }
 					}
 				default:
-					// spew.Dump(value)
-					// fmt.Printf("unknown field type in response: %+v\n", item.Fields[f])
-					// log.Fatalf("unknown field type in response: %+v\n", item.Fields[f])
+					log.Fatal(fmt.Errorf("Invalid type found %+v\n", value))
 				}
-				if foundData != false {
-					columns = append(columns, strings.Join(c, *separator))
-				}
-				// else {
-				// 	println("found no data for desired rows")
-				// 	spew.Dump(fields, item, hit)
-				// }
 
+				var outerSeparator string
+				if foundInnerArray == true {
+					outerSeparator = *secondarySeparator
+				} else {
+					outerSeparator = *separator
+				}
+				columns = append(columns, strings.Join(c, outerSeparator))
 			}
 
 			if len(columns) > 0 {
-				// resultsChannel <- strings.Join(columns, *delimiter)
-				// fmt.Fprintln(w, strings.Join(columns, *delimiter))
+				fmt.Fprintln(w, strings.Join(columns, *delimiter))
 			}
 
-			bar.Increment()
+			// bar.Increment()
 
 			// Terminate early?
 			select {
@@ -315,6 +319,7 @@ func main() {
 				return ctx.Err()
 			}
 		}
+
 		return nil
 	})
 
@@ -324,87 +329,7 @@ func main() {
 	}
 
 	// Done.
-	bar.FinishPrint("Done")
-
-	// for {
-	//   scrollResponse, err := conn.Scroll(scanResponse.ScrollId, *timeout)
-	//   if err == io.EOF {
-	//     break
-	//   }
-	//   if err != nil {
-	//     log.Fatal(err)
-	//   }
-	//   if len(scrollResponse.Hits.Hits) == 0 {
-	//     break
-	//   }
-	//   for _, hit := range scrollResponse.Hits.Hits {
-	//     if i == *limit {
-	//       return
-	//     }
-	//     if *raw {
-	//       b, err := json.Marshal(hit)
-	//       if err != nil {
-	//         log.Fatal(err)
-	//       }
-	//       fmt.Fprintln(w, string(b))
-	//       continue
-	//     }
-
-	//     var columns []string
-	//     for _, f := range fields {
-	//       var c []string
-	//       switch f {
-	//       case "_id":
-	//         c = append(c, hit.Id)
-	//       case "_index":
-	//         c = append(c, hit.Index)
-	//       case "_type":
-	//         c = append(c, hit.Type)
-	//       case "_score":
-	//         c = append(c, strconv.FormatFloat(hit.Score, 'f', 6, 64))
-	//       default:
-	//         switch value := hit.Fields[f].(type) {
-	//         case nil:
-	//           c = []string{*nullValue}
-	//         case []interface{}:
-	//           for _, e := range value {
-	//             switch e.(type) {
-	//             case string:
-	//               s := e.(string)
-	//               if s == "" && *zeroAsNull {
-	//                 c = append(c, *nullValue)
-	//               } else {
-	//                 c = append(c, e.(string))
-	//               }
-	//             case float64:
-	//               if !isFloatingPoint(e.(float64)) {
-	//                 c = append(c, fmt.Sprintf("%.0f", e.(float64)))
-	//               } else {
-	//                 c = append(c, strconv.FormatFloat(e.(float64), 'G', *precision, 64))
-	//               }
-	//             case bool:
-	//               c = append(c, strconv.FormatBool(e.(bool)))
-	//             }
-	//           }
-	//         default:
-	//           fmt.Printf("unknown field type in response: %+v\n", hit.Fields[f])
-	//           log.Fatalf("unknown field type in response: %+v\n", hit.Fields[f])
-	//         }
-	//       }
-	//       if *singleValue {
-	//         for _, value := range c {
-	//           fmt.Fprintln(w, value)
-	//         }
-	//       } else {
-	//         columns = append(columns, strings.Join(c, *separator))
-	//       }
-	//     }
-	//     if !*singleValue {
-	//       fmt.Fprintln(w, strings.Join(columns, *delimiter))
-	//     }
-	//     i++
-	//   }
-	// }
+	// bar.FinishPrint("Done")
 }
 
 func isFloatingPoint(value float64) bool {
@@ -425,40 +350,3 @@ func round(val float64, roundOn float64, places int) (newVal float64) {
 	newVal = round / pow
 	return
 }
-
-// type Response struct {
-// 	// Acknowledged bool
-// 	// Error        string
-// 	// Errors       bool
-// 	// Status       uint64
-// 	// Took         uint64
-// 	// TimedOut     bool  `json:"timed_out"`
-// 	// Shards       Shard `json:"_shards"`
-// 	// Hits         Hits
-// 	// Index        string `json:"_index"`
-// 	// Id           string `json:"_id"`
-// 	// Type         string `json:"_type"`
-// 	// Version      int    `json:"_version"`
-// 	// Found        bool
-// 	// Count        int
-
-// 	// Used by the _stats API
-// 	// All All `json:"_all"`
-
-// 	// Used by the _bulk API
-// 	// Items []map[string]Item `json:"items,omitempty"`
-
-// 	// Used by the GET API
-// 	Source map[string]interface{} `json:"_source"`
-// 	Fields map[string]interface{} `json:"fields"`
-
-// 	// Used by the _status API
-// 	// Indices map[string]IndexStatus
-
-// 	// Scroll id for iteration
-// 	// ScrollId string `json:"_scroll_id"`
-
-// 	// Aggregations map[string]Aggregation `json:"aggregations,omitempty"`
-
-// 	Raw map[string]interface{}
-// }
